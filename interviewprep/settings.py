@@ -111,13 +111,15 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 
 USE_TZ = True
+LOGIN_REDIRECT_URL = '/'  # Redirect to index after login
+LOGOUT_REDIRECT_URL = '/login/'  # Redirect to login after logout
 
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.1/howto/static-files/
 import os 
 STATIC_URL = 'static/'
-STATICFILES_DIRS=[os.path.join(BASE_DIR,'C:/Users/PYTHON/Music/static-main/interviewprep/static')]
+STATICFILES_DIRS=[os.path.join(BASE_DIR,'C:/Users/JIJI/OneDrive/Desktop/JobAI-2-main/interviewprep/static')]
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field

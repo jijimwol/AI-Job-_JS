@@ -2,22 +2,21 @@ from django.shortcuts import render, redirect
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
 from django.contrib import messages
-from django.http import JsonResponse
 from django.contrib.auth.decorators import login_required
-from django.views.decorators.csrf import csrf_exempt
-from transformers import pipeline
 from .models import InterviewPractice, PersonalityAnalysis
+from .forms import QuestionForm, AnswerForm
+from transformers import pipeline
 
-# Initialize AI pipelines
+# Initialize AI models
 question_generator = pipeline("text2text-generation", model="google/flan-t5-large")
 suggested_answer_generator = pipeline("text2text-generation", model="google/flan-t5-large")
 answer_evaluator = pipeline("text-classification", model="distilbert-base-uncased-finetuned-sst-2-english")
 
-# Home View
+# 🔹 Home Page
 def home(request):
     return render(request, 'home.html')
 
-# Register View
+# 🔹 Register View
 def register_view(request):
     if request.method == "POST":
         username = request.POST.get("username")
@@ -35,7 +34,7 @@ def register_view(request):
 
     return render(request, "log_reg.html")
 
-# Login View
+# 🔹 Login View
 def login_view(request):
     if request.method == "POST":
         username = request.POST.get("username")
@@ -52,137 +51,154 @@ def login_view(request):
 
     return render(request, "log_reg.html")
 
-# Logout View
+# 🔹 Logout View
 def logout_view(request):
     logout(request)
     messages.success(request, "You have been logged out.")
     return redirect("login")
 
-# Index View
-def index(request):
-    return render(request, 'index.html')
+# 🔹 Interview Practice Dashboard
 
-# Summary View
 @login_required
+def index(request):
+    question_form = QuestionForm()
+    answer_form = AnswerForm()
+    practice = None
+    feedback = None
+    suggested_answer = None
+
+    if request.method == "POST":
+        if "generate_question" in request.POST or "try_another_question" in request.POST:
+            question_form = QuestionForm(request.POST)
+            if question_form.is_valid():
+                domain = question_form.cleaned_data['domain']
+                job_description = question_form.cleaned_data['job_description']
+
+                prompt = f"Generate a unique interview question for a {domain} role. Job requirements: {job_description}"
+                question_output = question_generator(prompt, max_length=50, num_return_sequences=1, do_sample=True, temperature=0.9)[0]['generated_text']
+
+                practice = InterviewPractice.objects.create(
+                    user=request.user,
+                    domain=domain,
+                    job_description=job_description,
+                    question=question_output.strip()
+                )
+
+        elif "submit_answer" in request.POST:
+            practice_id = request.POST.get("practice_id")
+            practice = InterviewPractice.objects.get(id=practice_id)
+            answer_form = AnswerForm(request.POST, instance=practice)
+
+            if answer_form.is_valid():
+                practice.user_answer = answer_form.cleaned_data["user_answer"]
+
+                evaluation_result = answer_evaluator(practice.user_answer)[0]
+                label = evaluation_result['label']
+                score = evaluation_result['score']
+
+                feedback = "✅ Excellent response!" if label == "POSITIVE" and score > 0.85 else \
+                           "⚠️ Good answer, but you could improve it." if label == "POSITIVE" else \
+                           "❌ Needs improvement. Try being more specific."
+
+                practice.feedback = feedback
+                practice.save()
+
+        elif "get_suggested_answer" in request.POST:
+            practice_id = request.POST.get("practice_id")
+            practice = InterviewPractice.objects.get(id=practice_id)
+
+            answer_prompt = f"Provide a detailed and structured answer for the interview question: '{practice.question}' based on the job description: {practice.job_description}."
+            suggested_answer_output = suggested_answer_generator(
+                answer_prompt,
+                max_length=500,
+                num_return_sequences=1,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9
+            )[0]['generated_text']
+
+            practice.suggested_answer = suggested_answer_output.strip()
+            practice.save()
+            suggested_answer = practice.suggested_answer
+
+    return render(request, "index.html", {
+        "question_form": question_form,
+        "answer_form": answer_form,
+        "question": practice.question if practice else None,
+        "practice_id": practice.id if practice else None,
+        "feedback": feedback,
+        "suggested_answer": suggested_answer
+    })
+@login_required(login_url='/login/')
 def summary_view(request):
-    """
-    Renders the summary page with user's interview responses and personality analysis.
-    """
     user_responses = InterviewPractice.objects.filter(user=request.user).order_by('-id')
-    
-    # Fetch personality analysis if available
     personality = PersonalityAnalysis.objects.filter(user=request.user).first()
 
     return render(request, "summary.html", {
         "user_responses": user_responses,
         "personality": personality
     })
+import random
+from django.shortcuts import render
+from django.contrib.auth.decorators import login_required
+from .models import InterviewPractice, PersonalityAnalysis
+from transformers import pipeline
+import json
 
-# Generate Interview Question
-@csrf_exempt
-def generate_question(request):
-    if request.method == 'POST':
-        domain = request.POST.get('domain', 'general')
-        job_description = request.POST.get('job_description', '')
-        new_question = request.POST.get('new_question', 'false').lower() == 'true'
+# Initialize AI sentiment analysis model
+sentiment_analyzer = pipeline("text-classification", model="distilbert-base-uncased-finetuned-sst-2-english")
 
-        if not job_description:
-            return JsonResponse({'error': 'Job description is required'}, status=400)
+@login_required
+def analyze_personality(request):
+    user_responses = InterviewPractice.objects.filter(user=request.user, user_answer__isnull=False)
 
-        prompt = (f"Generate {'another' if new_question else 'a'} unique domain-specific interview question for a {domain} role. "
-                  f"Job requirements: {job_description}")
+    if not user_responses.exists():
+        return render(request, "personality.html", {"error": "No responses available for analysis."})
 
-        try:
-            question_output = question_generator(prompt, max_length=50, num_return_sequences=1, do_sample=True, temperature=0.9)[0]['generated_text']
+    # Initialize personality traits with base scores
+    traits = {
+        "openness": 50,
+        "conscientiousness": 50,
+        "extraversion": 50,
+        "agreeableness": 50,
+        "neuroticism": 50
+    }
 
-            # Save to DB
-            practice = InterviewPractice.objects.create(
-                user=request.user,  # ✅ Assign the logged-in user
-                domain=domain,
-                job_description=job_description,
-                question=question_output.strip()
-            )
+    # AI-based personality adjustments
+    for response in user_responses:
+        answer = response.user_answer.lower()
+        sentiment = sentiment_analyzer(answer)[0]  # Sentiment analysis result
 
-            return JsonResponse({
-                'question': question_output.strip(),
-                'practice_id': practice.id
-            })
+        if "creative" in answer or "curious" in answer:
+            traits["openness"] += random.randint(5, 10)
+        if "organized" in answer or "detail" in answer:
+            traits["conscientiousness"] += random.randint(5, 10)
+        if "team" in answer or "lead" in answer:
+            traits["extraversion"] += random.randint(5, 10)
+        if "helpful" in answer or "cooperate" in answer:
+            traits["agreeableness"] += random.randint(5, 10)
+        if sentiment["label"] == "NEGATIVE":
+            traits["neuroticism"] += random.randint(5, 15)
 
-        except Exception as e:
-            return JsonResponse({'error': f'Error generating question: {str(e)}'}, status=500)
+    # Normalize scores (0-100)
+    for key in traits:
+        traits[key] = min(traits[key], 100)
 
-    return JsonResponse({'error': 'Invalid request method'}, status=405)
+    # Store or update personality analysis in database
+    personality, created = PersonalityAnalysis.objects.update_or_create(
+        user=request.user,
+        defaults=traits,
+    )
 
-# Evaluate User's Answer
-@csrf_exempt
-def evaluate_answer(request):
-    if request.method == 'POST':
-        user_answer = request.POST.get('user_answer', '')
-        question = request.POST.get('question', '')
-        practice_id = request.POST.get('practice_id')
+    return render(request, "personality.html", {"traits": json.dumps(traits)})
+from django.shortcuts import redirect
+from django.contrib.auth.decorators import login_required
+from django.contrib import messages
+from .models import InterviewPractice
 
-        if not user_answer or not question:
-            return JsonResponse({'error': 'Answer and question required'}, status=400)
-
-        try:
-            evaluation_result = answer_evaluator(user_answer)[0]
-            label = evaluation_result['label']
-            score = evaluation_result['score']
-
-            if label == "POSITIVE" and score > 0.85:
-                feedback = "✅ Excellent response! You nailed it."
-            elif label == "POSITIVE":
-                feedback = "⚠️ Good answer, but you could expand with specific examples."
-            elif label == "NEGATIVE" and score > 0.7:
-                feedback = "❌ Needs improvement. Focus on aligning with the question."
-            else:
-                feedback = "❓ The answer was too vague. Add details and examples."
-
-            # Update DB
-            practice = InterviewPractice.objects.get(id=practice_id)
-            practice.user_answer = user_answer
-            practice.feedback = feedback
-            practice.save()
-
-            return JsonResponse({'feedback': feedback, 'confidence': f"{score:.2f}"})
-
-        except Exception as e:
-            return JsonResponse({'error': f'Error evaluating answer: {str(e)}'}, status=500)
-
-    return JsonResponse({'error': 'Invalid request method'}, status=405)
-
-# Generate Suggested Answer
-@csrf_exempt
-def get_suggested_answer(request):
-    if request.method == 'POST':
-        question = request.POST.get('question', '')
-        job_description = request.POST.get('job_description', '')
-        practice_id = request.POST.get('practice_id')
-
-        if not question or not job_description:
-            return JsonResponse({'error': 'Question and job description are required'}, status=400)
-
-        try:
-            answer_prompt = (f"Provide a detailed and structured answer for the interview question: '{question}' "
-                             f"based on the following job description: {job_description}. Include an introduction, "
-                             f"key points, and a conclusion with specific examples.")
-
-            suggested_answer_output = suggested_answer_generator(
-                answer_prompt,
-                max_length=500,  # Increased length for detailed responses
-                num_return_sequences=1,
-                do_sample=True,  # Allow variation
-                temperature=0.7,  # More balanced creativity
-                top_p=0.9  # Better-quality responses
-            )[0]['generated_text']
-
-            # Update DB
-            practice = InterviewPractice.objects.get(id=practice_id)
-            practice.suggested_answer = suggested_answer_output.strip()
-            practice.save()
-
-            return JsonResponse({'suggested_answer': suggested_answer_output.strip()})
-        except Exception as e:
-            return JsonResponse({'error': f'Error generating suggested answer: {str(e)}'}, status=500)
-
-    return JsonResponse({'error': 'Invalid request method'}, status=405)
+@login_required
+def clear_history(request):
+    if request.method == "POST":
+        InterviewPractice.objects.filter(user=request.user).delete()
+        messages.success(request, "Your interview history has been cleared.")
+        return redirect("summary")
